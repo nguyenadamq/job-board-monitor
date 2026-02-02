@@ -56,7 +56,32 @@ RE_PUNCT_TO_SPACE = re.compile(r"[^\w\s-]", re.UNICODE)
 # ----------------------------
 # Title matching (match Greenhouse behavior)
 # ----------------------------
-KEYWORDS = ("software engineer", "software developer", "ai engineer", "full stack", "frontend engineer")
+KEYWORDS = (
+  "software engineer intern",
+  "software engineering intern",
+  "software developer intern",
+  "swe intern",
+  "intern software engineer",
+  "new grad software engineer",
+  "software engineer new grad",
+  "software engineer entry level",
+  "entry level software engineer",
+  "junior software engineer",
+  "associate software engineer",
+  "software engineer i",
+  "software developer i",
+  "backend engineer intern",
+  "frontend engineer intern",
+  "front end engineer intern",
+  "full stack engineer intern",
+  "full stack developer intern",
+  "full stack engineer entry level",
+  "web developer intern",
+  "web developer entry level",
+  "frontend developer intern",
+  "front end developer intern"
+)
+
 
 TITLE_NOISE_PATTERNS = [
     r"\bsenior\b",

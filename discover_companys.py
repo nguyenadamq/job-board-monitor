@@ -168,7 +168,7 @@ def main():
     client = SerpApiClient(SERPAPI_KEYS)
 
     for platform, cfg in ATS.items():
-        out = f"{platform}_companies.txt"
+        out = f"data/companies/{platform}_companies.txt"
         urls = harvest_platform(client, platform, cfg, out)
         print(f"{platform} done: {len(urls)} total -> {out}", flush=True)
 
