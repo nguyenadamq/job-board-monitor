@@ -12,6 +12,7 @@ from urllib.parse import urlparse, unquote
 
 import aiohttp
 from dotenv import load_dotenv
+from status_monitor import init_status_db, record_cycle, record_source_status
 
 load_dotenv(".env.local")
 
@@ -39,10 +40,18 @@ TIMEOUT_SECONDS = int(os.getenv("TIMEOUT_SECONDS", "20"))
 COMPANY_LIMIT = int(os.getenv("COMPANY_LIMIT", "0"))
 
 # companies/sec (start rate)
-COMPANIES_PER_SECOND = float(os.getenv("COMPANIES_PER_SECOND", "3.0"))
+COMPANIES_PER_SECOND = float(os.getenv("COMPANIES_PER_SECOND", "2.0"))  # consider lowering
 
 # in-flight requests cap (keep modest)
 CONCURRENCY = int(os.getenv("CONCURRENCY", "3"))
+
+# Retry/backoff for rate limits
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
+BACKOFF_BASE_SECONDS = float(os.getenv("BACKOFF_BASE_SECONDS", "1.0"))
+BACKOFF_MAX_SECONDS = float(os.getenv("BACKOFF_MAX_SECONDS", "30.0"))
+
+# Optional: a shared “cooldown” when we hit 429, to slow the whole fleet a bit
+GLOBAL_429_COOLDOWN_SECONDS = float(os.getenv("GLOBAL_429_COOLDOWN_SECONDS", "0.0"))
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_ASHBYHQ", "").strip()
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
@@ -54,88 +63,100 @@ RE_SPACES = re.compile(r"\s+")
 RE_PUNCT_TO_SPACE = re.compile(r"[^\w\s-]", re.UNICODE)
 
 # ----------------------------
-# Title matching (match Greenhouse behavior)
+# Title matching (broader, robust)
 # ----------------------------
-KEYWORDS = (
-  "software engineer intern",
-  "software engineering intern",
-  "software developer intern",
-  "swe intern",
-  "intern software engineer",
-  "new grad software engineer",
-  "software engineer new grad",
-  "software engineer entry level",
-  "entry level software engineer",
-  "junior software engineer",
-  "associate software engineer",
-  "software engineer i",
-  "software developer i",
-  "backend engineer intern",
-  "frontend engineer intern",
-  "front end engineer intern",
-  "full stack engineer intern",
-  "full stack developer intern",
-  "full stack engineer entry level",
-  "web developer intern",
-  "web developer entry level",
-  "frontend developer intern",
-  "front end developer intern"
-)
 
-
-TITLE_NOISE_PATTERNS = [
-    r"\bsenior\b",
-    r"\bsr\.?\b",
-    r"\bprincipal\b",
-    r"\bstaff\b",
-    r"\blead\b",
-    r"\bjunior\b",
-    r"\bmid\b",
-    r"\bintern\b",
-    r"\bii\b",
-    r"\biii\b",
-    r"\biv\b",
-    r"\b1\b",
-    r"\b2\b",
-    r"\b3\b",
-    r"\b4\b",
-]
-
+# Exclude clearly non-target or senior/management titles.
 EXCLUDE_TITLE_PATTERNS = [
     r"\bsenior\b",
     r"\bsr\.?\b",
     r"\bstaff\b",
-    r"\blead\b",
     r"\bprincipal\b",
+    r"\blead\b",
     r"\bmanager\b",
     r"\bdirector\b",
+    r"\bhead\b",
+    r"\bvp\b",
+    r"\bvice president\b",
+    r"\bchief\b",
+
+    # Non-target specialties (tune as you like)
     r"\bmachine\s*learning\b",
     r"\bml\b",
-    r"\bdata engineer\b",
-    r"\bfield engineer\b",
+    r"\bdata\b",
+    r"\banalytics\b",
+    r"\bsecurity\b",
+    r"\binfrastructure\b",
+    r"\bsre\b",
+    r"\bsite reliability\b",
+    r"\bdevops\b",
     r"\bembedded\b",
-    r"\breliability engineer\b",
-    r"\bnetwork engineer\b",
-    r"\bsoftware engineer\s*ii\b",
-    r"\bsoftware engineer\s*iii\b",
+    r"\bfirmware\b",
+    r"\bnetwork\b",
+    r"\btest\b",
+    r"\bqa\b",
+    r"\bquality\b",
+    r"\bautomation\b",
+    r"\bmobile\b",
+    r"\bios\b",
+    r"\bandroid\b",
+    r"\bgame\b",
+    r"\bgraphics\b",
+    r"\brobotics\b",
+    r"\breliability\b",
 ]
 
+# Role family patterns: if any match, treat as SWE-related.
+ROLE_INCLUDE_PATTERNS = [
+    r"\bsoftware\s+engineer\b",
+    r"\bsoftware\s+developer\b",
+    r"\bbackend\b.*\b(engineer|developer)\b",
+    r"\bfront\s*end\b.*\b(engineer|developer)\b",
+    r"\bfrontend\b.*\b(engineer|developer)\b",
+    r"\bfull\s*stack\b.*\b(engineer|developer)\b",
+    r"\bfullstack\b.*\b(engineer|developer)\b",
+    r"\bweb\b.*\b(engineer|developer)\b",
+    r"\bapplication\b.*\b(engineer|developer)\b",
+    r"\bplatform\b.*\b(engineer|developer)\b",
+    r"\bapi\b.*\b(engineer|developer)\b",
+]
 
-def normalize_title_gh(title: str) -> str:
+# Optional level hints (only used if you uncomment the gate in title_matches).
+LEVEL_HINT_PATTERNS = [
+    r"\bintern\b",
+    r"\bco[-\s]?op\b",
+    r"\bnew\s*grad\b",
+    r"\bgraduate\b",
+    r"\bearly\s*career\b",
+    r"\bentry\b",
+    r"\bentry[-\s]?level\b",
+    r"\bjunior\b",
+    r"\bassociate\b",
+    r"\b(level|lvl)\s*(1|i)\b",
+    r"\bsoftware\s+engineer\s*(1|i)\b",
+    r"\bengineer\s*(1|i)\b",
+]
+
+def normalize_title(title: str) -> str:
     t = (title or "").lower().strip()
     t = re.sub(r"[^\w\s]", " ", t)
-    for pat in TITLE_NOISE_PATTERNS:
-        t = re.sub(pat, " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
+def title_matches(title: str) -> bool:
+    t = normalize_title(title)
 
-def title_allowed(title: str) -> bool:
-    raw = (title or "").lower()
-    if any(re.search(p, raw) for p in EXCLUDE_TITLE_PATTERNS):
+    if any(re.search(p, t) for p in EXCLUDE_TITLE_PATTERNS):
         return False
-    t = normalize_title_gh(title)
-    return any(k in t for k in KEYWORDS)
+
+    if not any(re.search(p, t) for p in ROLE_INCLUDE_PATTERNS):
+        return False
+
+    # If you want only early-career roles, uncomment this gate.
+    # if not any(re.search(p, t) for p in LEVEL_HINT_PATTERNS):
+    #     return False
+
+    return True
 
 
 # ----------------------------
@@ -278,6 +299,28 @@ class StartRateLimiter:
                 await asyncio.sleep(self._next_allowed - now)
             self._next_allowed = time.monotonic() + self.interval + random.uniform(0.0, self.interval * 0.25)
 
+def _parse_retry_after(headers: "aiohttp.typedefs.LooseHeaders") -> Optional[float]:
+    # Retry-After can be seconds or an HTTP date; we handle seconds only.
+    try:
+        ra = None
+        if hasattr(headers, "get"):
+            ra = headers.get("Retry-After")
+        if not ra:
+            return None
+        ra = str(ra).strip()
+        if ra.isdigit():
+            return float(ra)
+    except Exception:
+        pass
+    return None
+
+
+def _exp_backoff(attempt: int) -> float:
+    # attempt=0 => base, attempt=1 => 2*base, etc, with jitter
+    raw = BACKOFF_BASE_SECONDS * (2 ** attempt)
+    raw = min(raw, BACKOFF_MAX_SECONDS)
+    jitter = random.uniform(0.0, raw * 0.25)
+    return raw + jitter
 
 # ----------------------------
 # Ashby GraphQL call
@@ -295,7 +338,6 @@ query ApiJobBoardWithTeams($organizationHostedJobsPageName: String!) {
   }
 }
 """
-
 
 async def fetch_postings(session: aiohttp.ClientSession, slug: str) -> tuple[str, List[Dict[str, Any]]]:
     payload = {
@@ -316,24 +358,54 @@ async def fetch_postings(session: aiohttp.ClientSession, slug: str) -> tuple[str
         "Origin": "https://jobs.ashbyhq.com",
     }
 
-    async with session.post(ASHBY_GQL_ENDPOINT, json=payload, headers=headers, timeout=TIMEOUT_SECONDS) as resp:
-        if resp.status != 200:
-            return f"http_{resp.status}", []
+    last_status: Optional[int] = None
+    for attempt in range(MAX_RETRIES + 1):
+        async with session.post(
+            ASHBY_GQL_ENDPOINT,
+            json=payload,
+            headers=headers,
+            timeout=TIMEOUT_SECONDS,
+        ) as resp:
+            last_status = resp.status
 
-        data = await resp.json(content_type=None)
-        if isinstance(data, dict) and data.get("errors"):
-            msg = (data["errors"][0].get("message") or "graphql_error").strip()
-            return f"gql_error:{msg}", []
+            # Rate limited: honor Retry-After if present, else exponential backoff
+            if resp.status == 429:
+                retry_after = _parse_retry_after(resp.headers)
+                sleep_for = retry_after if retry_after is not None else _exp_backoff(attempt)
 
-        postings = (((data.get("data") or {}).get("jobBoardWithTeams") or {}).get("jobPostings") or [])
-        return "ok", postings
+                # Optional global cooldown (helps reduce repeated throttling across 1000 slugs)
+                if GLOBAL_429_COOLDOWN_SECONDS > 0:
+                    sleep_for = max(sleep_for, GLOBAL_429_COOLDOWN_SECONDS)
 
+                await asyncio.sleep(sleep_for)
+                continue
+
+            # Transient server errors can be retried too
+            if resp.status in (500, 502, 503, 504):
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(_exp_backoff(attempt))
+                    continue
+                return f"http_{resp.status}", []
+
+            if resp.status != 200:
+                return f"http_{resp.status}", []
+
+            data = await resp.json(content_type=None)
+            if isinstance(data, dict) and data.get("errors"):
+                msg = (data["errors"][0].get("message") or "graphql_error").strip()
+                return f"gql_error:{msg}", []
+
+            postings = (((data.get("data") or {}).get("jobBoardWithTeams") or {}).get("jobPostings") or [])
+            return "ok", postings
+
+    # If we exhausted retries (likely persistent 429)
+    return f"http_{last_status or 429}", []
 
 def filter_matches(slug: str, postings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for p in postings:
         title = (p.get("title") or "").strip()
-        if not title_allowed(title):
+        if not title_matches(title):
             continue
 
         opening_id = str(p.get("id") or "").strip()
@@ -451,6 +523,7 @@ async def _post_discord_chunk(session: aiohttp.ClientSession, text: str) -> None
 async def fetch_one(
     session: aiohttp.ClientSession,
     conn: sqlite3.Connection,
+    status_conn: sqlite3.Connection,
     limiter: StartRateLimiter,
     sem: asyncio.Semaphore,
     slug: str,
@@ -470,6 +543,7 @@ async def fetch_one(
             status, postings = await fetch_postings(session, slug)
             if status != "ok":
                 save_state(conn, slug, now_ts, prior.notified_job_ids_json)
+                record_source_status(status_conn, "ashby", slug, status, "request failed")
                 return slug, status, 0, 0
 
             if print_raw:
@@ -499,13 +573,22 @@ async def fetch_one(
                 await post_discord(session, msg)
 
             save_state(conn, slug, now_ts, json.dumps(sorted(list(notified_ids))))
+            record_source_status(
+                status_conn,
+                "ashby",
+                slug,
+                "new match" if new_matches else "ok",
+                f"postings={len(postings)} new_matches={len(new_matches)}",
+            )
             return slug, "new match" if new_matches else "ok", len(postings), len(new_matches)
 
         except asyncio.TimeoutError:
             save_state(conn, slug, now_ts, prior.notified_job_ids_json)
+            record_source_status(status_conn, "ashby", slug, "timeout", "request timed out")
             return slug, "timeout", 0, 0
         except Exception as e:
             save_state(conn, slug, now_ts, prior.notified_job_ids_json)
+            record_source_status(status_conn, "ashby", slug, f"exception:{e}", "unexpected error")
             return slug, f"exception:{e}", 0, 0
 
 
@@ -528,10 +611,16 @@ async def run_forever() -> None:
     print(f"DB: {DB_PATH}")
 
     conn = init_db()
+    status_conn = init_status_db()
 
     timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
-    connector = aiohttp.TCPConnector(limit=CONCURRENCY)
+    connector = aiohttp.TCPConnector(
+        limit=CONCURRENCY,
+        limit_per_host=max(1, CONCURRENCY),  # keep it aligned; prevents accidental host spikes if you change code later
+        ttl_dns_cache=300,
+    )
     sem = asyncio.Semaphore(CONCURRENCY)
+    
     limiter = StartRateLimiter(COMPANIES_PER_SECOND)
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
@@ -539,7 +628,7 @@ async def run_forever() -> None:
             start = time.time()
 
             tasks = [
-                asyncio.create_task(fetch_one(session, conn, limiter, sem, slug, print_raw=False))
+                asyncio.create_task(fetch_one(session, conn, status_conn, limiter, sem, slug, print_raw=False))
                 for slug in slugs
             ]
             results = await asyncio.gather(*tasks)
@@ -559,6 +648,7 @@ async def run_forever() -> None:
                 f"Cycle done in {elapsed:.1f}s. total_postings={total_postings} "
                 f"new_matches={total_new_matches}. {summary}"
             )
+            record_cycle(status_conn, "ashby", counts, int(elapsed * 1000))
 
             sleep_for = POLL_INTERVAL_SECONDS + random.randint(0, max(JITTER_SECONDS, 0))
             await asyncio.sleep(sleep_for)

@@ -11,4 +11,4 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY . /app
 
 #Default
-CMD ["python", "discover_companies.py"]
+CMD ["python", "run_all.py"]

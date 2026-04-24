@@ -18,27 +18,45 @@ if not SERPAPI_KEYS:
 ATS = {
     "ashbyhq": {
         "queries": [
-            'site:jobs.ashbyhq.com',
-            'site:jobs.ashbyhq.com inurl:application',
-            'site:jobs.ashbyhq.com "Careers" OR "Open roles"',
+            # 1) Job detail pages (lots of coverage, high unique slugs)
+            'site:jobs.ashbyhq.com inurl:/jobs/ ("software" OR engineer OR engineering OR developer OR "data" OR security OR "product") -inurl:/application',
+
+            # 2) Board root and section pages (great for direct slug discovery)
+            'site:jobs.ashbyhq.com "jobs.ashbyhq.com/" (careers OR jobs OR openings OR "open roles" OR "open positions" OR "join our team") -inurl:/application',
+
+            # 3) Non-English / international boards (big expansion)
+            'site:jobs.ashbyhq.com ("empleo" OR "trabaja con" OR "karriere" OR stellen OR vacatures OR emploi OR "offres d\'emploi") -inurl:/application',
+
+            # 4) Broad catch-all, still excludes obvious noise
+            'site:jobs.ashbyhq.com -inurl:/application -inurl:/job -inurl:/embed -inurl:/api',
         ],
         "host": "jobs.ashbyhq.com",
         "base_url": "https://jobs.ashbyhq.com/{slug}",
     },
     "lever": {
         "queries": [
-            'site:jobs.lever.co',
-            'site:jobs.lever.co "Powered by Lever"',
-            'site:jobs.lever.co inurl:/apply',
+            # 1) Apply pages with hiring keywords (high yield)
+            'site:jobs.lever.co inurl:/apply (engineer OR engineering OR developer OR "software" OR "data" OR security OR product)',
+
+            # 2) Company root pages (slug pages)
+            'site:jobs.lever.co -inurl:/apply (careers OR jobs OR openings OR "join our team" OR "we\'re hiring")',
+
+            # 3) ATS fingerprint text
+            'site:jobs.lever.co ("Powered by Lever" OR "lever.co" "apply")',
         ],
         "host": "jobs.lever.co",
         "base_url": "https://jobs.lever.co/{slug}",
     },
     "greenhouse": {
         "queries": [
-            'site:boards.greenhouse.io',
-            'site:boards.greenhouse.io "Powered by Greenhouse"',
-            'site:boards.greenhouse.io inurl:/jobs/',
+            # 1) Job pages with hiring keywords (high yield)
+            'site:boards.greenhouse.io inurl:/jobs/ (engineer OR engineering OR developer OR "software" OR "data" OR security OR product)',
+
+            # 2) Board root/company pages (best direct slug discovery)
+            'site:boards.greenhouse.io (careers OR jobs OR openings OR "join our team") -inurl:/jobs/',
+
+            # 3) Fingerprint
+            'site:boards.greenhouse.io ("Powered by Greenhouse" OR greenhouse.io) -inurl:/embed',
         ],
         "host": "boards.greenhouse.io",
         "base_url": "https://boards.greenhouse.io/{slug}",

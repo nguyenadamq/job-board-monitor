@@ -13,6 +13,7 @@ import re
 
 import aiohttp
 from dotenv import load_dotenv
+from status_monitor import init_status_db, record_cycle, record_source_status
 
 # Load local env file
 load_dotenv(".env.local")
@@ -130,90 +131,108 @@ def format_new_jobs_message(slug: str, new_jobs: list, limit: int = 15) -> str:
 
 
 # ----------------------------
-# Title matching
+# Title matching (broader, more robust)
 # ----------------------------
-KEYWORDS = (
-  "software engineer intern",
-  "software engineering intern",
-  "software developer intern",
-  "swe intern",
-  "intern software engineer",
-  "new grad software engineer",
-  "software engineer new grad",
-  "software engineer entry level",
-  "entry level software engineer",
-  "junior software engineer",
-  "associate software engineer",
-  "software engineer i",
-  "software developer i",
-  "backend engineer intern",
-  "frontend engineer intern",
-  "front end engineer intern",
-  "full stack engineer intern",
-  "full stack developer intern",
-  "full stack engineer entry level",
-  "web developer intern",
-  "web developer entry level",
-  "frontend developer intern",
-  "front end developer intern"
-)
 
-
-TITLE_NOISE_PATTERNS = [
-    r"\bsenior\b",
-    r"\bsr\.?\b",
-    r"\bprincipal\b",
-    r"\bstaff\b",
-    r"\blead\b",
-    r"\bjunior\b",
-    r"\bmid\b",
-    r"\bintern\b",
-    r"\bii\b",
-    r"\biii\b",
-    r"\biv\b",
-    r"\b1\b",
-    r"\b2\b",
-    r"\b3\b",
-    r"\b4\b",
-]
-
+# Exclude clearly non-target or senior/management titles.
+# (Keep this list conservative; it's easy to over-exclude and miss good roles.)
 EXCLUDE_TITLE_PATTERNS = [
     r"\bsenior\b",
     r"\bsr\.?\b",
     r"\bstaff\b",
-    r"\blead\b",
     r"\bprincipal\b",
+    r"\blead\b",
     r"\bmanager\b",
     r"\bdirector\b",
+    r"\bhead\b",
+    r"\bvp\b",
+    r"\bvice president\b",
+    r"\bchief\b",
+
+    # Non-target specialties (tune to your preference)
     r"\bmachine\s*learning\b",
     r"\bml\b",
-    r"\bdata engineer\b",
-    r"\bfield engineer\b",
+    r"\bdata\b",
+    r"\banalytics\b",
+    r"\bsecurity\b",
+    r"\binfrastructure\b",
+    r"\bsre\b",
+    r"\bsite reliability\b",
+    r"\bdevops\b",
     r"\bembedded\b",
-    r"\breliability engineer\b",
-    r"\bnetwork engineer\b",
-    r"\bsoftware engineer\s*ii\b",
-    r"\bsoftware engineer\s*iii\b",
+    r"\bfirmware\b",
+    r"\bnetwork\b",
+    r"\btest\b",
+    r"\bqa\b",
+    r"\bquality\b",
+    r"\bautomation\b",
+    r"\bmobile\b",
+    r"\bios\b",
+    r"\bandroid\b",
+    r"\bgame\b",
+    r"\bgraphics\b",
+    r"\brobotics\b",
+    r"\breliability\b",
 ]
 
+# "Role family" patterns: if any of these match, we consider it SWE-related.
+# This is intentionally broad.
+ROLE_INCLUDE_PATTERNS = [
+    r"\bsoftware\s+engineer\b",
+    r"\bsoftware\s+developer\b",
+    r"\bbackend\b.*\b(engineer|developer)\b",
+    r"\bfront\s*end\b.*\b(engineer|developer)\b",
+    r"\bfrontend\b.*\b(engineer|developer)\b",
+    r"\bfull\s*stack\b.*\b(engineer|developer)\b",
+    r"\bfullstack\b.*\b(engineer|developer)\b",
+    r"\bweb\b.*\b(engineer|developer)\b",
+    r"\bapplication\b.*\b(engineer|developer)\b",
+    r"\bplatform\b.*\b(engineer|developer)\b",
+    r"\bapi\b.*\b(engineer|developer)\b",
+]
+
+# "Level hints" that commonly appear for intern / early-career roles.
+# If a title has a SWE role but no level hint, we'll still allow it (unless excluded),
+# because many boards omit "new grad" etc.
+LEVEL_HINT_PATTERNS = [
+    r"\bintern\b",
+    r"\bco[-\s]?op\b",
+    r"\bnew\s*grad\b",
+    r"\bgraduate\b",
+    r"\bearly\s*career\b",
+    r"\bentry\b",
+    r"\bentry[-\s]?level\b",
+    r"\bjunior\b",
+    r"\bassociate\b",
+    r"\b(level|lvl)\s*(1|i)\b",
+    r"\bsoftware\s+engineer\s*(1|i)\b",
+    r"\bengineer\s*(1|i)\b",
+]
 
 def normalize_title(title: str) -> str:
     t = (title or "").lower().strip()
+    # Keep words like intern/junior; just normalize punctuation/whitespace.
     t = re.sub(r"[^\w\s]", " ", t)
-    for pat in TITLE_NOISE_PATTERNS:
-        t = re.sub(pat, " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
-
 def title_matches(title: str) -> bool:
-    raw = (title or "").lower()
-    if any(re.search(p, raw) for p in EXCLUDE_TITLE_PATTERNS):
+    t = normalize_title(title)
+
+    # Hard exclude first
+    if any(re.search(p, t) for p in EXCLUDE_TITLE_PATTERNS):
         return False
 
-    t = normalize_title(title)
-    return any(k in t for k in KEYWORDS)
+    # Must look like SWE-ish
+    if not any(re.search(p, t) for p in ROLE_INCLUDE_PATTERNS):
+        return False
 
+    # If you want to be stricter and only alert on early-career,
+    # uncomment the next 2 lines.
+    # if not any(re.search(p, t) for p in LEVEL_HINT_PATTERNS):
+    #     return False
+
+    return True
 
 # ----------------------------
 # US location matching
@@ -422,7 +441,10 @@ async def notify(session: aiohttp.ClientSession, message: str) -> None:
 # Polling
 # ----------------------------
 async def fetch_company(
-    session: aiohttp.ClientSession, conn: sqlite3.Connection, slug: str
+    session: aiohttp.ClientSession,
+    conn: sqlite3.Connection,
+    status_conn: sqlite3.Connection,
+    slug: str,
 ) -> Tuple[str, str]:
     api_url = greenhouse_jobs_api(slug)
     prior = load_state(conn, slug)
@@ -444,10 +466,12 @@ async def fetch_company(
         async with session.get(api_url, headers=headers, timeout=TIMEOUT_SECONDS) as resp:
             if resp.status == 304:
                 save_state(conn, slug, prior.etag, prior.last_modified, prior.fingerprint, now_ts, prior.notified_job_ids_json)
+                record_source_status(status_conn, "greenhouse", slug, "unchanged (304)", "not modified")
                 return slug, "unchanged (304)"
 
             if resp.status != 200:
                 save_state(conn, slug, prior.etag, prior.last_modified, prior.fingerprint, now_ts, prior.notified_job_ids_json)
+                record_source_status(status_conn, "greenhouse", slug, f"error HTTP {resp.status}", f"api={api_url}")
                 return slug, f"error HTTP {resp.status}"
 
             etag = resp.headers.get("ETag")
@@ -487,14 +511,23 @@ async def fetch_company(
                 now_ts,
                 json.dumps(sorted(list(notified_ids))),
             )
+            record_source_status(
+                status_conn,
+                "greenhouse",
+                slug,
+                "new match" if new_matching else "ok",
+                f"jobs={len(jobs)} new_matches={len(new_matching)}",
+            )
 
             return slug, "new match" if new_matching else "ok"
 
     except asyncio.TimeoutError:
         save_state(conn, slug, prior.etag, prior.last_modified, prior.fingerprint, now_ts, prior.notified_job_ids_json)
+        record_source_status(status_conn, "greenhouse", slug, "timeout", f"api={api_url}")
         return slug, "timeout"
     except Exception as e:
         save_state(conn, slug, prior.etag, prior.last_modified, prior.fingerprint, now_ts, prior.notified_job_ids_json)
+        record_source_status(status_conn, "greenhouse", slug, f"exception: {e}", f"api={api_url}")
         return slug, f"exception: {e}"
 
 
@@ -508,6 +541,7 @@ async def run_forever():
     print(f"Watching {len(slugs)} company boards (from {COMPANIES_FILE})")
 
     conn = init_db()
+    status_conn = init_status_db()
     timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
     connector = aiohttp.TCPConnector(limit=CONCURRENCY)
 
@@ -516,7 +550,7 @@ async def run_forever():
 
         async def bounded_fetch(s: str):
             async with sem:
-                return await fetch_company(session, conn, s)
+                return await fetch_company(session, conn, status_conn, s)
 
         while True:
             start = time.time()
@@ -528,6 +562,7 @@ async def run_forever():
                 counts[status] = counts.get(status, 0) + 1
             summary = ", ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
             print(f"Cycle done in {time.time() - start:.1f}s. {summary}")
+            record_cycle(status_conn, "greenhouse", counts, int((time.time() - start) * 1000))
 
             sleep_for = POLL_INTERVAL_SECONDS + random.randint(0, JITTER_SECONDS)
             await asyncio.sleep(sleep_for)

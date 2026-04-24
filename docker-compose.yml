@@ -1,32 +1,50 @@
 services:
   discover:
     build: .
-    command: ["python", "discover_companies.py"]
-    env_file: [.env]
+    command: ["python", "discover_companys.py"]
+    env_file: [.env.local]
     volumes:
-      - ./data:/data
+      - ./data:/app/data
     restart: "no"
 
   ashby:
     build: .
     command: ["python", "ashby.py"]
-    env_file: [.env]
+    env_file: [.env.local]
     volumes:
-      - ./data:/data
+      - ./data:/app/data
     restart: unless-stopped
 
   greenhouse:
     build: .
     command: ["python", "greenhouse.py"]
-    env_file: [.env]
+    env_file: [.env.local]
     volumes:
-      - ./data:/data
+      - ./data:/app/data
     restart: unless-stopped
 
   lever:
     build: .
     command: ["python", "lever.py"]
-    env_file: [.env]
+    env_file: [.env.local]
     volumes:
-      - ./data:/data
+      - ./data:/app/data
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    command: ["python", "dashboard.py"]
+    env_file: [.env.local]
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  monitors:
+    build: .
+    command: ["python", "run_all.py"]
+    env_file: [.env.local]
+    volumes:
+      - ./data:/app/data
     restart: unless-stopped
