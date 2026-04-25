@@ -183,6 +183,7 @@ def harvest_platform(client: SerpApiClient, name: str, cfg: dict, out_file: str)
     return discovered_urls
 
 def main():
+    os.makedirs("data/companies", exist_ok=True)
     client = SerpApiClient(SERPAPI_KEYS)
 
     for platform, cfg in ATS.items():

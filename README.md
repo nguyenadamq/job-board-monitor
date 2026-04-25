@@ -1,81 +1,80 @@
 # Job Board Tracker
 
-A job monitoring system that discovers company-hosted job boards and continuously checks them for new postings. It filters for target roles and US locations, stores per-company state locally, and sends notifications to Discord.
+A self-hosted job-board monitoring system for Ashby, Greenhouse, and Lever career pages. It discovers company-hosted job boards, polls them on a schedule, filters for target US software engineering roles, stores notification state locally, and sends Discord/Slack alerts for newly seen matches.
 
-## What’s Included
+## What It Runs
 
-### 1) Company Discovery (Build company lists)
-**Script:** `discover_companys.py`  
-**Tech:** Python, Requests, SerpAPI (Google Search API)  
-**Output files:**
-- `ashbyhq_companies.txt`
-- `greenhouse_companies.txt`
-- `lever_companies.txt`
+- `ashby.py` monitors `jobs.ashbyhq.com` boards through Ashby's public GraphQL endpoint.
+- `greenhouse.py` monitors `boards.greenhouse.io` boards through Greenhouse's public API.
+- `lever.py` monitors `jobs.lever.co` boards through Lever's public API.
+- `dashboard.py` serves a live monitor dashboard at `http://localhost:8080`.
+- `status_monitor.py` stores source-level health and cycle history in SQLite.
+- `discover_companys.py` uses SerpAPI search results to discover Ashby, Greenhouse, and Lever company boards.
 
-### 2) Job Board Monitors (Watch boards and notify)
-Each monitor:
-- Reads a company list file (one company per line)
-- Polls the board API in a loop
-- Stores state in SQLite to prevent duplicate alerts
-- Sends notifications only for newly-seen matching jobs
+## How It Works
 
-**Monitors and tech**
-- Ashby: Python, asyncio, aiohttp, SQLite, GraphQL
-- Greenhouse: Python, asyncio, aiohttp, SQLite, REST
-- Lever: Python, asyncio, aiohttp, SQLite, REST
-- SmartRecruiters: Python, asyncio, aiohttp, SQLite, REST
-- Workable: Python, asyncio, aiohttp, SQLite, REST
-- RippleMatch: Python, asyncio, aiohttp, SQLite, HTML scrape of public category pages
+1. Read source-specific company lists from `data/companies/`.
+2. Normalize each company entry into the board identifier that provider expects.
+3. Poll the provider endpoint asynchronously with concurrency limits and jitter.
+4. Filter postings down to SWE-style titles and US locations.
+5. Store already-notified job IDs in SQLite under `data/watch/`.
+6. Send webhook notifications only for newly seen matching jobs.
+7. Record health data for the dashboard after each monitor cycle.
 
-## How It Works Today
+## Required Company Lists
 
-Each monitor follows the same pattern:
+The monitors expect these local files:
 
-1. Read a source-specific text file from `data/companies/`.
-2. Normalize each entry into the board identifier or page URL that provider expects.
-3. Poll the provider's public endpoint or page in an async loop.
-4. Filter jobs down to SWE-style titles and US locations.
-5. Store already-notified job ids in a source-specific SQLite database under `data/watch/`.
-6. Send webhook notifications only for newly-seen matching jobs.
+- `data/companies/ashbyhq_companies.txt`
+- `data/companies/greenhouse_companies.txt`
+- `data/companies/lever_companies.txt`
 
-## New Source Inputs
+Each file should contain one company board URL or slug per line. Run `python discover_companys.py` to expand or rebuild the lists with SerpAPI.
 
-- `smartrecruiters.py`: one company identifier or `jobs.smartrecruiters.com/<company>` URL per line
-- `workable.py`: one account slug or `apply.workable.com/<account>/` URL per line
-- `ripplematch.py`: one RippleMatch category/source page per line, such as `computer-science-majors` or the full `https://ripplematch.com/jobs/computer-science-majors/` URL
+## Run Locally
 
-## Run Multiple Monitors Together
+```bash
+pip install -r requirements.txt
+copy .env.example .env.local
+python run_all.py
+```
 
-You can now run Ashby, Greenhouse, and Lever together in either of these ways:
+Start the dashboard separately:
 
-- Local: `python run_all.py`
-- Docker Compose, separate services: `docker compose up ashby greenhouse lever dashboard`
-- Docker Compose, single monitor container: `docker compose up monitors dashboard`
+```bash
+python dashboard.py
+```
 
-The live monitoring dashboard is available at `http://localhost:8080`.
+## Run With Docker Compose
 
-## Live Error Monitoring
+Run the three monitors and dashboard as separate services:
 
-The monitors now write source-level status data to `data/watch/monitor_status.db`.
+```bash
+docker compose up ashby greenhouse lever dashboard
+```
+
+Or run the three monitors through one process plus the dashboard:
+
+```bash
+docker compose up monitors dashboard
+```
+
+Run company discovery:
+
+```bash
+docker compose run --rm discover
+```
+
+## Configuration
+
+Copy `.env.example` to `.env.local`, then fill in the webhooks and SerpAPI keys you want to use. The app writes generated runtime state to `data/watch/`, which is intentionally ignored by git.
+
+## Dashboard
 
 The dashboard shows:
 
-- Which service is currently healthy vs failing
-- Which specific source slug/company returned an error
-- The exact last error text for that source
-- Recent status/error events across all monitor services
-- Latest check results so you can watch changes live while the containers are running
-
----
-
-## Requirements
-
-- Python 3.10+ recommended
-- Packages:
-  - `python-dotenv`
-  - `requests` (for discovery)
-  - `aiohttp` (for monitors)
-
-Install dependencies:
-```bash
-pip install -r requirements.txt
+- health status by provider
+- source-level errors
+- recent status events
+- cycle duration and summary counts
+- error trend history
