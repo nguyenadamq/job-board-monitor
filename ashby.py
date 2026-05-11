@@ -32,26 +32,30 @@ COMPANIES_FILE = COMPANIES_DIR / "ashbyhq_companies.txt"
 # Use the env var name
 DB_PATH = WATCH_DIR / os.getenv("ASHBY_DB", "ashbyhq_watch.db")
 
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
-JITTER_SECONDS = int(os.getenv("JITTER_SECONDS", "10"))
-TIMEOUT_SECONDS = int(os.getenv("TIMEOUT_SECONDS", "20"))
+def ashby_env(name: str, default: str) -> str:
+    return os.getenv(f"ASHBY_{name}", default)
+
+
+POLL_INTERVAL_SECONDS = int(ashby_env("POLL_INTERVAL_SECONDS", "300"))
+JITTER_SECONDS = int(ashby_env("JITTER_SECONDS", os.getenv("JITTER_SECONDS", "60")))
+TIMEOUT_SECONDS = int(ashby_env("TIMEOUT_SECONDS", os.getenv("TIMEOUT_SECONDS", "20")))
 
 # 0 = all
-COMPANY_LIMIT = int(os.getenv("COMPANY_LIMIT", "0"))
+COMPANY_LIMIT = int(ashby_env("COMPANY_LIMIT", os.getenv("COMPANY_LIMIT", "0")))
 
 # companies/sec (start rate)
-COMPANIES_PER_SECOND = float(os.getenv("COMPANIES_PER_SECOND", "2.0"))  # consider lowering
+COMPANIES_PER_SECOND = float(ashby_env("COMPANIES_PER_SECOND", "0.35"))
 
 # in-flight requests cap (keep modest)
-CONCURRENCY = int(os.getenv("CONCURRENCY", "3"))
+CONCURRENCY = int(ashby_env("CONCURRENCY", "2"))
 
 # Retry/backoff for rate limits
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
-BACKOFF_BASE_SECONDS = float(os.getenv("BACKOFF_BASE_SECONDS", "1.0"))
-BACKOFF_MAX_SECONDS = float(os.getenv("BACKOFF_MAX_SECONDS", "30.0"))
+MAX_RETRIES = int(ashby_env("MAX_RETRIES", os.getenv("MAX_RETRIES", "6")))
+BACKOFF_BASE_SECONDS = float(ashby_env("BACKOFF_BASE_SECONDS", "5.0"))
+BACKOFF_MAX_SECONDS = float(ashby_env("BACKOFF_MAX_SECONDS", "180.0"))
 
 # Optional: a shared “cooldown” when we hit 429, to slow the whole fleet a bit
-GLOBAL_429_COOLDOWN_SECONDS = float(os.getenv("GLOBAL_429_COOLDOWN_SECONDS", "0.0"))
+GLOBAL_429_COOLDOWN_SECONDS = float(ashby_env("GLOBAL_429_COOLDOWN_SECONDS", "60.0"))
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_ASHBYHQ", "").strip()
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
@@ -441,7 +445,19 @@ class StoredState:
 
 
 def init_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    try:
+        return _init_db()
+    except sqlite3.DatabaseError as e:
+        print(f"[warn] Ashby state db appears unhealthy; moving it aside and recreating: {e}", flush=True)
+        quarantine_db(DB_PATH)
+        return _init_db()
+
+
+def _init_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS company_state (
@@ -455,6 +471,17 @@ def init_db() -> sqlite3.Connection:
     return conn
 
 
+def quarantine_db(db_path: Path) -> None:
+    stamp = int(time.time())
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        path = Path(f"{db_path}{suffix}")
+        if path.exists():
+            try:
+                path.replace(path.with_name(f"{path.name}.corrupt.{stamp}"))
+            except OSError as e:
+                print(f"[warn] failed to move unhealthy db file {path}: {e}", flush=True)
+
+
 def load_state(conn: sqlite3.Connection, slug: str) -> StoredState:
     row = conn.execute(
         "SELECT last_seen_ts, notified_job_ids_json FROM company_state WHERE slug = ?",
@@ -466,17 +493,20 @@ def load_state(conn: sqlite3.Connection, slug: str) -> StoredState:
 
 
 def save_state(conn: sqlite3.Connection, slug: str, last_seen_ts: int, notified_job_ids_json: Optional[str]) -> None:
-    conn.execute(
-        """
-        INSERT INTO company_state (slug, last_seen_ts, notified_job_ids_json)
-        VALUES (?, ?, ?)
-        ON CONFLICT(slug) DO UPDATE SET
-            last_seen_ts=excluded.last_seen_ts,
-            notified_job_ids_json=excluded.notified_job_ids_json
-        """,
-        (slug, last_seen_ts, notified_job_ids_json),
-    )
-    conn.commit()
+    try:
+        conn.execute(
+            """
+            INSERT INTO company_state (slug, last_seen_ts, notified_job_ids_json)
+            VALUES (?, ?, ?)
+            ON CONFLICT(slug) DO UPDATE SET
+                last_seen_ts=excluded.last_seen_ts,
+                notified_job_ids_json=excluded.notified_job_ids_json
+            """,
+            (slug, last_seen_ts, notified_job_ids_json),
+        )
+        conn.commit()
+    except sqlite3.DatabaseError as e:
+        print(f"[warn] Ashby state db write failed for {slug}: {e}", flush=True)
 
 
 # ----------------------------
@@ -626,29 +656,40 @@ async def run_forever() -> None:
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         while True:
             start = time.time()
+            try:
+                tasks = [
+                    asyncio.create_task(fetch_one(session, conn, status_conn, limiter, sem, slug, print_raw=False))
+                    for slug in slugs
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            tasks = [
-                asyncio.create_task(fetch_one(session, conn, status_conn, limiter, sem, slug, print_raw=False))
-                for slug in slugs
-            ]
-            results = await asyncio.gather(*tasks)
+                counts: Dict[str, int] = {}
+                total_postings = 0
+                total_new_matches = 0
 
-            counts: Dict[str, int] = {}
-            total_postings = 0
-            total_new_matches = 0
+                for result in results:
+                    if isinstance(result, Exception):
+                        status = f"task_exception:{type(result).__name__}"
+                        counts[status] = counts.get(status, 0) + 1
+                        print(f"[warn] Ashby task failed without source result: {result}", flush=True)
+                        continue
+                    _, status, postings_n, new_matches_n = result
+                    counts[status] = counts.get(status, 0) + 1
+                    total_postings += postings_n
+                    total_new_matches += new_matches_n
 
-            for _, status, postings_n, new_matches_n in results:
-                counts[status] = counts.get(status, 0) + 1
-                total_postings += postings_n
-                total_new_matches += new_matches_n
-
-            summary = ", ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
-            elapsed = time.time() - start
-            print(
-                f"Cycle done in {elapsed:.1f}s. total_postings={total_postings} "
-                f"new_matches={total_new_matches}. {summary}"
-            )
-            record_cycle(status_conn, "ashby", counts, int(elapsed * 1000))
+                summary = ", ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
+                elapsed = time.time() - start
+                print(
+                    f"Cycle done in {elapsed:.1f}s. total_postings={total_postings} "
+                    f"new_matches={total_new_matches}. {summary}",
+                    flush=True,
+                )
+                record_cycle(status_conn, "ashby", counts, int(elapsed * 1000))
+            except Exception as e:
+                elapsed = time.time() - start
+                print(f"[error] Ashby cycle failed after {elapsed:.1f}s: {e}", flush=True)
+                record_cycle(status_conn, "ashby", {f"cycle_exception:{type(e).__name__}": 1}, int(elapsed * 1000))
 
             sleep_for = POLL_INTERVAL_SECONDS + random.randint(0, max(JITTER_SECONDS, 0))
             await asyncio.sleep(sleep_for)

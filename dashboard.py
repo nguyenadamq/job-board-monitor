@@ -2,12 +2,16 @@ import os
 from datetime import datetime, timezone
 
 from aiohttp import web
+from dotenv import load_dotenv
 
 from status_monitor import STATUS_DB_PATH, get_dashboard_snapshot
+from structured_logging import configure_logger, log_event
 
 
+load_dotenv(".env.local")
 DASHBOARD_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
 DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8080"))
+LOGGER = configure_logger("dashboard")
 
 
 def format_ts(ts: int | None) -> str:
@@ -54,6 +58,30 @@ HTML = """<!DOCTYPE html>
       grid-template-columns:repeat(auto-fit,minmax(240px,1fr));
       gap:16px;
       margin-bottom:18px;
+    }
+    .metric-grid {
+      display:grid;
+      grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+      gap:12px;
+      margin:14px 0 16px;
+    }
+    .metric-card {
+      background:#fffaf2;
+      border:1px solid var(--border);
+      border-radius:14px;
+      padding:14px;
+    }
+    .metric-value {
+      font-size:28px;
+      font-weight:700;
+      margin-top:6px;
+    }
+    .dist-row {
+      display:flex;
+      justify-content:space-between;
+      gap:12px;
+      border-bottom:1px solid var(--border);
+      padding:7px 0;
     }
     .card, .service-card, .section-card, .board-card {
       background:var(--card);
@@ -254,6 +282,11 @@ HTML = """<!DOCTYPE html>
 
     <div id="services" class="service-grid"></div>
 
+    <div class="section-card">
+      <h2>Job Intelligence</h2>
+      <div id="intelligence"></div>
+    </div>
+
     <div class="graph-grid" id="graphs"></div>
 
     <div class="section-card">
@@ -281,6 +314,10 @@ HTML = """<!DOCTYPE html>
 
     function esc(value) {
       return String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+    }
+
+    function escAttr(value) {
+      return esc(value).replaceAll('"',"&quot;");
     }
 
     function chartSvg(points) {
@@ -400,6 +437,50 @@ HTML = """<!DOCTYPE html>
       `).join("") || '<div class="service-card">No cycle data yet.</div>';
     }
 
+    function renderDistribution(rows, labelKey) {
+      return rows.slice(0, 8).map(row => `
+        <div class="dist-row">
+          <span>${esc(row[labelKey])}</span>
+          <strong>${esc(row.count)}</strong>
+        </div>
+      `).join("") || '<div class="empty">No classifications yet.</div>';
+    }
+
+    function renderIntelligence(intelligence) {
+      const latest = intelligence.latest_high_relevance_jobs || [];
+      document.getElementById("intelligence").innerHTML = `
+        <div class="metric-grid">
+          <div class="metric-card"><div class="muted">Jobs Stored</div><div class="metric-value">${esc(intelligence.total_jobs || 0)}</div></div>
+          <div class="metric-card"><div class="muted">Jobs Classified</div><div class="metric-value">${esc(intelligence.classified_jobs || 0)}</div></div>
+          <div class="metric-card"><div class="muted">High Relevance</div><div class="metric-value">${esc(intelligence.high_relevance_jobs || 0)}</div></div>
+        </div>
+        <div class="nested-list">
+          <div class="nested-card">
+            <h3>Role Types</h3>
+            ${renderDistribution(intelligence.role_type_distribution || [], "role_type")}
+          </div>
+          <div class="nested-card">
+            <h3>Seniorities</h3>
+            ${renderDistribution(intelligence.seniority_distribution || [], "seniority")}
+          </div>
+        </div>
+        <table style="margin-top:16px">
+          <thead><tr><th>Score</th><th>Company</th><th>Role</th><th>Fit</th><th>Reason</th></tr></thead>
+          <tbody>
+            ${latest.map(job => `
+              <tr>
+                <td>${esc(job.relevance_score)}</td>
+                <td>${esc(job.company)}</td>
+                <td><a href="${escAttr(job.url)}" target="_blank" rel="noreferrer">${esc(job.title)}</a></td>
+                <td>${esc(job.role_type)} / ${esc(job.seniority)} / ${esc(job.location_fit)}</td>
+                <td>${esc(job.reason)}</td>
+              </tr>
+            `).join("") || '<tr><td colspan="5">No high-relevance jobs yet.</td></tr>'}
+          </tbody>
+        </table>
+      `;
+    }
+
     function renderRecentEvents(events) {
       document.getElementById("recent-events").innerHTML = events.map(row => `
         <tr>
@@ -428,6 +509,7 @@ HTML = """<!DOCTYPE html>
       const res = await fetch("/api/status");
       const data = await res.json();
       renderServices(data.services);
+      renderIntelligence(data.intelligence || {});
       renderGraphs(data.history_by_service);
       renderBoardErrors(data.services, data.error_groups);
       renderRecentEvents(data.recent_events);
@@ -470,4 +552,10 @@ def build_app() -> web.Application:
 
 
 if __name__ == "__main__":
-    web.run_app(build_app(), host=DASHBOARD_HOST, port=DASHBOARD_PORT)
+    log_event(LOGGER, "dashboard_started", host=DASHBOARD_HOST, port=DASHBOARD_PORT)
+    web.run_app(
+        build_app(),
+        host=DASHBOARD_HOST,
+        port=DASHBOARD_PORT,
+        print=lambda message: log_event(LOGGER, "dashboard_runtime_message", message=message),
+    )

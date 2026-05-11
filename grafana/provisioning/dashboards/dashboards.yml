@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: Job Tracker
+    orgId: 1
+    folder: Job Tracker
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards

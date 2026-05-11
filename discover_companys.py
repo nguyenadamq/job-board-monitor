@@ -4,8 +4,10 @@ import re
 import requests
 from urllib.parse import urlparse
 from dotenv import load_dotenv
+from structured_logging import configure_logger, log_event
 
 load_dotenv(".env.local")
+LOGGER = configure_logger("discover")
 
 SEARCH_URL = "https://serpapi.com/search.json"
 
@@ -13,7 +15,8 @@ SEARCH_URL = "https://serpapi.com/search.json"
 # SERPAPI_KEYS=key1,key2,key3,key4
 SERPAPI_KEYS = [k.strip() for k in os.getenv("SERPAPI_KEYS", "").split(",") if k.strip()]
 if not SERPAPI_KEYS:
-    raise SystemExit("Missing SERPAPI_KEYS env var (comma-separated list)")
+    log_event(LOGGER, "configuration_error", level="ERROR", missing_env_var="SERPAPI_KEYS")
+    raise SystemExit(1)
 
 ATS = {
     "ashbyhq": {
@@ -93,8 +96,9 @@ class SerpApiClient:
     def _rotate_key(self):
         self.idx += 1
         if self.idx >= len(self.keys):
-            raise SystemExit("All SerpApi keys exhausted")
-        print(f"Switching to key #{self.idx + 1}", flush=True)
+            log_event(LOGGER, "serpapi_keys_exhausted", level="ERROR")
+            raise SystemExit(1)
+        log_event(LOGGER, "serpapi_key_rotated", key_index=self.idx + 1)
 
     def google(self, query: str, start: int) -> dict:
         while True:
@@ -149,12 +153,20 @@ def harvest_platform(client: SerpApiClient, name: str, cfg: dict, out_file: str)
         start = 0
 
         while start <= 900 and no_new_pages < 5:
-            print(f"[{name}] q='{q}' start={start} total={len(discovered_urls)}", flush=True)
+            log_event(
+                LOGGER,
+                "search_page_started",
+                level="DEBUG",
+                platform=name,
+                query=q,
+                start=start,
+                discovered_total=len(discovered_urls),
+            )
 
             data = client.google(q, start=start)
             results = data.get("organic_results", [])
             if not results:
-                print(f"[{name}] no results, stopping this query", flush=True)
+                log_event(LOGGER, "search_query_exhausted", platform=name, query=q, start=start)
                 break
 
             new_urls = []
@@ -175,7 +187,16 @@ def harvest_platform(client: SerpApiClient, name: str, cfg: dict, out_file: str)
             else:
                 no_new_pages = 0
 
-            print(f"[{name}] +{len(new_urls)} new (total {len(discovered_urls)})", flush=True)
+            log_event(
+                LOGGER,
+                "search_page_completed",
+                level="INFO" if new_urls else "DEBUG",
+                platform=name,
+                query=q,
+                start=start,
+                new_urls=len(new_urls),
+                discovered_total=len(discovered_urls),
+            )
 
             start += 10
             time.sleep(1.0)
@@ -189,7 +210,7 @@ def main():
     for platform, cfg in ATS.items():
         out = f"data/companies/{platform}_companies.txt"
         urls = harvest_platform(client, platform, cfg, out)
-        print(f"{platform} done: {len(urls)} total -> {out}", flush=True)
+        log_event(LOGGER, "platform_completed", platform=platform, discovered_total=len(urls), output_file=out)
 
 if __name__ == "__main__":
     main()

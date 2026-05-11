@@ -1,3 +1,9 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   discover:
     build: .
@@ -6,6 +12,7 @@ services:
     volumes:
       - ./data:/app/data
     restart: "no"
+    logging: *default-logging
 
   ashby:
     build: .
@@ -14,6 +21,7 @@ services:
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    logging: *default-logging
 
   greenhouse:
     build: .
@@ -22,6 +30,7 @@ services:
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    logging: *default-logging
 
   lever:
     build: .
@@ -30,6 +39,7 @@ services:
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    logging: *default-logging
 
   dashboard:
     build: .
@@ -38,8 +48,53 @@ services:
     volumes:
       - ./data:/app/data
     ports:
-      - "8080:8080"
+      - "127.0.0.1:${DASHBOARD_PORT:-18080}:8080"
     restart: unless-stopped
+    logging: *default-logging
+
+  metrics:
+    build: .
+    command: ["python", "metrics_exporter.py"]
+    env_file: [.env.local]
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "127.0.0.1:${METRICS_PORT:-19108}:9108"
+    restart: unless-stopped
+    logging: *default-logging
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-19090}:9090"
+    depends_on:
+      - metrics
+    restart: unless-stopped
+    logging: *default-logging
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-13000}:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    logging: *default-logging
 
   monitors:
     build: .
@@ -48,3 +103,8 @@ services:
     volumes:
       - ./data:/app/data
     restart: unless-stopped
+    logging: *default-logging
+
+volumes:
+  prometheus-data:
+  grafana-data:

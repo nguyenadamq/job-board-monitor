@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 from typing import Dict, List
 
+from job_store import get_intelligence_snapshot
+
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 WATCH_DIR = DATA_DIR / "watch"
@@ -16,8 +18,19 @@ NON_ERROR_STATUSES = {"ok", "new match", "unchanged (304)"}
 
 
 def init_status_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(STATUS_DB_PATH)
+    try:
+        return _init_status_db()
+    except sqlite3.DatabaseError as e:
+        print(f"[warn] status db appears unhealthy; moving it aside and recreating: {e}", flush=True)
+        quarantine_status_db()
+        return _init_status_db()
+
+
+def _init_status_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(STATUS_DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS source_status (
@@ -76,12 +89,38 @@ def init_status_db() -> sqlite3.Connection:
     return conn
 
 
+def quarantine_status_db() -> None:
+    stamp = int(time.time())
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        path = Path(f"{STATUS_DB_PATH}{suffix}")
+        if not path.exists():
+            continue
+        target = path.with_name(f"{path.name}.corrupt.{stamp}")
+        try:
+            path.replace(target)
+        except OSError as e:
+            print(f"[warn] failed to move unhealthy status db file {path}: {e}", flush=True)
+
+
 def is_error_status(status: str) -> bool:
     normalized = (status or "").strip().lower()
     return normalized not in NON_ERROR_STATUSES
 
 
 def record_source_status(
+    conn: sqlite3.Connection,
+    service: str,
+    source: str,
+    status: str,
+    detail: str = "",
+) -> None:
+    try:
+        _record_source_status(conn, service, source, status, detail)
+    except sqlite3.DatabaseError as e:
+        print(f"[warn] status db write failed for {service}/{source}: {e}", flush=True)
+
+
+def _record_source_status(
     conn: sqlite3.Connection,
     service: str,
     source: str,
@@ -182,6 +221,18 @@ def record_source_status(
 
 
 def record_cycle(
+    conn: sqlite3.Connection,
+    service: str,
+    summary: Dict[str, int],
+    cycle_duration_ms: int,
+) -> None:
+    try:
+        _record_cycle(conn, service, summary, cycle_duration_ms)
+    except sqlite3.DatabaseError as e:
+        print(f"[warn] status db cycle write failed for {service}: {e}", flush=True)
+
+
+def _record_cycle(
     conn: sqlite3.Connection,
     service: str,
     summary: Dict[str, int],
@@ -291,6 +342,19 @@ def get_dashboard_snapshot() -> Dict[str, List[Dict[str, object]]]:
         history_by_service.setdefault(str(row["service"]), []).append(row)
 
     conn.close()
+    try:
+        min_relevance = int(os.getenv("MIN_RELEVANCE_SCORE", "75"))
+        intelligence = get_intelligence_snapshot(min_relevance_score=min_relevance)
+    except Exception as e:
+        intelligence = {
+            "error": str(e),
+            "total_jobs": 0,
+            "classified_jobs": 0,
+            "high_relevance_jobs": 0,
+            "latest_high_relevance_jobs": [],
+            "role_type_distribution": [],
+            "seniority_distribution": [],
+        }
     return {
         "services": services,
         "active_errors": active_errors,
@@ -298,4 +362,5 @@ def get_dashboard_snapshot() -> Dict[str, List[Dict[str, object]]]:
         "history_by_service": history_by_service,
         "recent_events": recent_events,
         "latest_sources": latest_sources,
+        "intelligence": intelligence,
     }

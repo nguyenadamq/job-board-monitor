@@ -348,7 +348,19 @@ class StoredState:
 
 
 def init_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    try:
+        return _init_db()
+    except sqlite3.DatabaseError as e:
+        print(f"[warn] Lever state db appears unhealthy; moving it aside and recreating: {e}", flush=True)
+        quarantine_db(DB_PATH)
+        return _init_db()
+
+
+def _init_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS company_state (
@@ -363,6 +375,17 @@ def init_db() -> sqlite3.Connection:
     )
     conn.commit()
     return conn
+
+
+def quarantine_db(db_path: Path) -> None:
+    stamp = int(time.time())
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        path = Path(f"{db_path}{suffix}")
+        if path.exists():
+            try:
+                path.replace(path.with_name(f"{path.name}.corrupt.{stamp}"))
+            except OSError as e:
+                print(f"[warn] failed to move unhealthy db file {path}: {e}", flush=True)
 
 
 def load_state(conn: sqlite3.Connection, company: str) -> StoredState:
@@ -384,20 +407,23 @@ def save_state(
     last_seen_ts: int,
     notified_job_ids_json: Optional[str],
 ) -> None:
-    conn.execute(
-        """
-        INSERT INTO company_state (company, etag, last_modified, fingerprint, last_seen_ts, notified_job_ids_json)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(company) DO UPDATE SET
-            etag=excluded.etag,
-            last_modified=excluded.last_modified,
-            fingerprint=excluded.fingerprint,
-            last_seen_ts=excluded.last_seen_ts,
-            notified_job_ids_json=excluded.notified_job_ids_json
-        """,
-        (company, etag, last_modified, fingerprint, last_seen_ts, notified_job_ids_json),
-    )
-    conn.commit()
+    try:
+        conn.execute(
+            """
+            INSERT INTO company_state (company, etag, last_modified, fingerprint, last_seen_ts, notified_job_ids_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(company) DO UPDATE SET
+                etag=excluded.etag,
+                last_modified=excluded.last_modified,
+                fingerprint=excluded.fingerprint,
+                last_seen_ts=excluded.last_seen_ts,
+                notified_job_ids_json=excluded.notified_job_ids_json
+            """,
+            (company, etag, last_modified, fingerprint, last_seen_ts, notified_job_ids_json),
+        )
+        conn.commit()
+    except sqlite3.DatabaseError as e:
+        print(f"[warn] Lever state db write failed for {company}: {e}", flush=True)
 
 
 # ----------------------------
@@ -558,15 +584,27 @@ async def run_forever() -> None:
 
         while True:
             start = time.time()
-            tasks = [asyncio.create_task(bounded_fetch(company)) for company in companies]
-            results = await asyncio.gather(*tasks)
+            try:
+                tasks = [asyncio.create_task(bounded_fetch(company)) for company in companies]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            counts = {}
-            for _, status in results:
-                counts[status] = counts.get(status, 0) + 1
-            summary = ", ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
-            print(f"Cycle done in {time.time() - start:.1f}s. {summary}")
-            record_cycle(status_conn, "lever", counts, int((time.time() - start) * 1000))
+                counts = {}
+                for result in results:
+                    if isinstance(result, Exception):
+                        status = f"task_exception:{type(result).__name__}"
+                        counts[status] = counts.get(status, 0) + 1
+                        print(f"[warn] Lever task failed without source result: {result}", flush=True)
+                        continue
+                    _, status = result
+                    counts[status] = counts.get(status, 0) + 1
+                summary = ", ".join(f"{k}: {v}" for k, v in sorted(counts.items()))
+                elapsed = time.time() - start
+                print(f"Cycle done in {elapsed:.1f}s. {summary}", flush=True)
+                record_cycle(status_conn, "lever", counts, int(elapsed * 1000))
+            except Exception as e:
+                elapsed = time.time() - start
+                print(f"[error] Lever cycle failed after {elapsed:.1f}s: {e}", flush=True)
+                record_cycle(status_conn, "lever", {f"cycle_exception:{type(e).__name__}": 1}, int(elapsed * 1000))
 
             sleep_for = POLL_INTERVAL_SECONDS + random.randint(0, JITTER_SECONDS)
             await asyncio.sleep(sleep_for)
